@@ -9,6 +9,8 @@
 #define COMBINE(X) START_ ## X
 #define CAT(A, B) A ## B
 
+#define CAT3(X) A##_##X
+
 #if '\xff' > 0
 #else
 #endif
@@ -32,19 +34,50 @@ int main() {
 	assert(CAT(0x, ff) == 0xff);
 
 	const char *include = NULL;
+
+	int CAT3(HELLO) = 10;
+	A_HELLO = 20;
+
 #
 	include = "Hello";
 assert(strcmp(include, "Hello") == 0);
 
-  #if defined(__LLP64__)
+#define TEST_DEF
+
+  #if defined(NOT_DEFINED)
 #error
-  #elif defined(__LP64__)
+  #elif defined(TEST_DEF)
 //#error
-  #elif defined(__ILP32__)
+  #elif defined(NOT_DEFINED)
 #error
   #else
 	#error
   #endif
+
+  #if defined(NOT_DEFINED)
+#error
+  #elif defined(TEST_DEF)
+//#error
+  #elif !defined(NOT_DEFINED)
+#error
+  #endif
+
+
+#define AAAA
+
+# if defined(AAAA)
+#  if defined(BBBB)
+#   error
+#  else
+//#   error
+#  endif
+# elif !defined(CCCC)
+#   error
+# endif
+
+#if 0
+#!
+#endif
 
 	return 0;
 }

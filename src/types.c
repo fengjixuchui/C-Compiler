@@ -8,6 +8,7 @@
 #include "types.h"
 #include "common.h"
 #include "parser/expression.h"
+#include <abi/abi.h>
 
 static int compare_types(struct type *a, struct type **a_children,
 						 struct type *b) {
@@ -127,7 +128,8 @@ struct type *type_create(struct type *params, struct type **children) {
 
 	struct type *new = malloc(sizeof(*params) + sizeof(*children) * params->n);
 	*new = *params;
-	memcpy(new->children, children, sizeof(*children) * params->n);
+	if (params->n)
+		memcpy(new->children, children, sizeof(*children) * params->n);
 
 	new->next = ffirst;
 	hashtable[hash_idx] = new;
@@ -162,6 +164,12 @@ struct type *type_deref(struct type *type) {
 struct type *type_make_const(struct type *type, int is_const) {
 	struct type params = *type;
 	params.is_const = is_const;
+	return type_create(&params, type->children);
+}
+
+struct type *type_remove_qualifications(struct type *type) {
+	struct type params = *type;
+	params.is_const = 0;
 	return type_create(&params, type->children);
 }
 
@@ -301,22 +309,34 @@ int type_is_pointer(struct type *type) {
 	return type->type == TY_POINTER;
 }
 
-void type_select(struct type *type, int index,
-				 int *field_offset, struct type **field_type) {
-	if (field_offset)
-		*field_offset = calculate_offset(type, index);
-
-	if (!field_type)
-		return;
-
+struct type *type_select(struct type *type, int index) {
 	switch (type->type) {
 	case TY_STRUCT:
-		*field_type = type->struct_data->fields[index].type;
-		break;
+		return type->struct_data->fields[index].type;
 
 	case TY_ARRAY:
 	case TY_INCOMPLETE_ARRAY:
-		*field_type = type->children[0];
+		return type->children[0];
+
+	default:
+		NOTIMP();
+	}
+}
+
+void type_get_offsets(struct type *type, int index, int *offset, int *bit_offset, int *bit_size) {
+	switch (type->type) {
+	case TY_STRUCT: {
+		struct field f = type->struct_data->fields[index];
+		*bit_offset = f.bit_offset;
+		*bit_size = f.bitfield;
+		*offset = f.offset;
+	} break;
+
+	case TY_ARRAY:
+	case TY_INCOMPLETE_ARRAY:
+		*bit_offset = 0;
+		*bit_size = -1;
+		*offset = calculate_offset(type, index);
 		break;
 
 	default:
@@ -383,7 +403,7 @@ struct expr *type_sizeof(struct type *type) {
 			ICE("Type can't have variable size");
 		}
 	} else {
-		struct constant c = {.type = CONSTANT_TYPE, .data_type = type_simple(ST_ULONG), .ulong_d = calculate_size(type) };
+		struct constant c = constant_simple_unsigned(abi_info.size_type, calculate_size(type));
 
 		return expr_new((struct expr) {
 				.type = E_CONSTANT,

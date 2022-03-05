@@ -42,7 +42,7 @@ void tokenizer_push_input(const char *path, int system) {
 }
 
 void tokenizer_disable_current_path(void) {
-	input_disable_path(input);
+	input_disable_path(input->filename);
 }
 
 static void flush_whitespace(int *whitespace, int *first_of_line) {
@@ -306,6 +306,7 @@ static int is_header, is_directive;
 struct token tokenizer_next(void) {
 	struct token next = { 0 };
 
+
 	flush_whitespace(&next.whitespace,
 					 &next.first_of_line);
 
@@ -331,8 +332,8 @@ struct token tokenizer_next(void) {
 			is_header = sv_string_cmp(next.str, "include");
 			is_directive = 0;
 		}
-	} else if(parse_punctuator(&next)) {
 	} else if(parse_pp_number(&next)) {
+	} else if(parse_punctuator(&next)) {
 	} else if(C0 == '\0') {
 		if (input->next) {
 			// Retry on popped source.

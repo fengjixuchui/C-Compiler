@@ -3,8 +3,9 @@
 #include "codegen/codegen.h"
 #include "common.h"
 #include "preprocessor/macro_expander.h"
-#include "arch/builtins.h"
+#include "assembler/assembler.h"
 #include "parser/symbols.h"
+#include "abi/abi.h"
 
 #include <time.h>
 #include <stdio.h>
@@ -23,6 +24,11 @@ struct arguments parse_arguments(int argc, char **argv) {
 		STATE_OUTPUT,
 		STATE_END
 	} state = STATE_INPUT;
+
+	enum {
+		ABI_SYSV,
+		ABI_MICROSOFT
+	} abi = ABI_SYSV;
 
 	for (int i = 1; i < argc; i++) {
 		if (argv[i][0] == '-' &&
@@ -46,20 +52,27 @@ struct arguments parse_arguments(int argc, char **argv) {
 				codegen_flags.cmodel = CMODEL_SMALL;
 			} else if (strcmp(argv[i] + 2, "cmodel=large") == 0) {
 				codegen_flags.cmodel = CMODEL_LARGE;
-			} else if (strcmp(argv[i] + 2, "dmodel=ILP64") == 0) {
-				parser_flags.dmodel = DMODEL_ILP64;
-			} else if (strcmp(argv[i] + 2, "dmodel=LLP64") == 0) {
-				parser_flags.dmodel = DMODEL_LLP64;
-			} else if (strcmp(argv[i] + 2, "dmodel=LP64") == 0) {
-				parser_flags.dmodel = DMODEL_LP64;
 			} else if (strncmp(argv[i] + 2, "debug-stack-size", 16) == 0) {
 				codegen_flags.debug_stack_size = 1;
 				if (argv[i][18] == '=') {
 					codegen_flags.debug_stack_min = atoi(argv[i] + 19);
 					printf("DBG STACK MIN: %d\n", codegen_flags.debug_stack_min);
 				}
+			} else if (strcmp(argv[i] + 2, "abi=ms") == 0) {
+				abi = ABI_MICROSOFT;
+			} else if (strcmp(argv[i] + 2, "abi=sysv") == 0) {
+				abi = ABI_SYSV;
+			} else if (strcmp(argv[i] + 2, "mingw-workarounds") == 0) {
+				abi_init_mingw_workarounds();
 			} else {
 				ARG_ERROR(i, "Invalid flag.");
+			}
+		} else if (argv[i][0] == '-' &&
+				   argv[i][1] == 'd') {
+			if (strcmp(argv[i] + 2, "half-assemble") == 0) {
+				assembler_flags.half_assemble = 1;
+			} else if (strcmp(argv[i] + 2, "elf") == 0) {
+				assembler_flags.elf = 1;
 			}
 		} else {
 			switch (state) {
@@ -83,6 +96,11 @@ struct arguments parse_arguments(int argc, char **argv) {
 		ARG_ERROR(0, "requires input and output.");
 	}
 
+	switch (abi) {
+	case ABI_SYSV: abi_init_sysv(); break;
+	case ABI_MICROSOFT: abi_init_microsoft(); break;
+	}
+
 	return args;
 }
 
@@ -100,31 +118,20 @@ void add_implementation_defs(void) {
 
 	define_string("__TIME__", allocate_printf("\"%02d:%02d:%02d\"", tm.tm_hour, tm.tm_min, tm.tm_sec));
 	define_string("__STDC__", "1");
+	define_string("__FUNCTION__", "__func__");
 	define_string("__STDC_HOSTED__", "0");
 	define_string("__STDC_VERSION__", "201710L");
 	define_string("__x86_64__", "1");
-
-	switch (parser_flags.dmodel) {
-	case DMODEL_LP64:
-		define_string("__LP64__", "1");
-		break;
-	case DMODEL_LLP64:
-		define_string("__LLP64__", "1");
-		break;
-	case DMODEL_ILP64:
-		define_string("__ILP64__", "1");
-		break;
-	}
 }
 
 int main(int argc, char **argv) {
+	symbols_init();
+
 	struct arguments arguments = parse_arguments(argc, argv);
 
 	init_source_character_set();
 
-	symbols_init();
 	add_implementation_defs();
-	builtins_init();
 
 	preprocessor_init(arguments.input);
 	parse_into_ir();

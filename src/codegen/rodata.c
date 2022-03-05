@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <assert.h>
 
 struct entry {
 	enum entry_type {
@@ -23,12 +24,11 @@ static struct entry *entries = NULL;
 static int entries_size = 0, entries_cap = 0;
 
 label_id label_register(enum entry_type type, struct string_view str) {
-	if (type == ENTRY_STR) {
-			for (int i = 0; i < entries_size; i++) {
-				if (sv_cmp(entries[i].name, str)) {
-					return entries[i].id;
-				}
-			}
+	for (int i = 0; i < entries_size; i++) {
+		if (sv_cmp(entries[i].name, str) &&
+			entries[i].type == type) {
+			return entries[i].id;
+		}
 	}
 
 	int id = entries_size;
@@ -45,36 +45,30 @@ label_id rodata_register(struct string_view str) {
 	return label_register(ENTRY_STR, str);
 }
 
-const char *rodata_get_label_string(label_id id) {
-	if (entries[id].type == ENTRY_STR) {
-		static char *buffer = NULL;
-
-		if (!buffer)
-			buffer = malloc(128);
-
-		sprintf(buffer, ".L_rodata%d", id);
-		return buffer;
+void rodata_get_label(label_id id, int n, char buffer[]) {
+	int res;
+	if (id < 0) { // Temporary label.
+		res = snprintf(buffer, n, ".L%d", -id);
+	} else if (entries[id].type == ENTRY_STR) {
+		res = snprintf(buffer, n, ".L_string%d", id);
 	} else if (entries[id].type == ENTRY_LABEL_NAME) {
-		return sv_to_str(entries[id].name);
+		res = snprintf(buffer, n, "%.*s", entries[id].name.len, entries[id].name.str);
 	} else {
 		NOTIMP();
 	}
+
+	if (res >= n)
+		ICE("Label name too long");
 }
 
 void rodata_codegen(void) {
 	for (int i = 0; i < entries_size; i++) {
 		if (entries[i].type != ENTRY_STR)
 			continue;
-		emit("%s:", rodata_get_label_string(entries[i].id));
 
-		emit_no_newline("\t.string \"", entries[i].name);
-		struct string_view str = entries[i].name;
-		for (int i = 0; i < str.len; i++) {
-			char buffer[5];
-			character_to_escape_sequence(str.str[i], buffer, 0);
-			emit_no_newline("%s", buffer);
-		}
-		emit_no_newline("\"\n");
+		asm_label(0, entries[i].id);
+
+		asm_string(entries[i].name);
 	}
 }
 
@@ -82,76 +76,80 @@ label_id register_label_name(struct string_view str) {
 	return label_register(ENTRY_LABEL_NAME, str);
 }
 
+label_id register_label(void) {
+	static int tmp_label_idx = -2; // -1 is left for null label.
+	return tmp_label_idx--;
+}
+
 struct static_var {
-	struct string_view label;
+	label_id label_;
 	struct type *type;
-	struct initializer *init;
+	struct initializer init;
 	int global;
 };
 
 static struct static_var *static_vars = NULL;
 static int static_vars_size, static_vars_cap;
 
-void data_register_static_var(struct string_view label, struct type *type, struct initializer *init, int global) {
+void data_register_static_var(struct string_view label, struct type *type, struct initializer init, int global) {
 	ADD_ELEMENT(static_vars_size, static_vars_cap, static_vars) = (struct static_var) {
-		.label = label,
+		.label_ = register_label_name(label),
 		.type = type,
 		.init = init,
 		.global = global
 	};
 }
 
-void codegen_initializer_recursive(struct initializer *init,
+void codegen_initializer_recursive(struct initializer *init, struct type *type,
+								   int bit_size, int bit_offset,
 								   uint8_t *buffer, label_id *labels,
-								   int64_t *label_offsets, int *is_label,
-								   size_t size) {
-	for (int i = 0; i < init->size; i++) {
-		struct init_pair *pair = init->pairs + i;
-		size_t offset = pair->offset;
+								   int64_t *label_offsets, int *is_label) {
+	switch (init->type) {
+	case INIT_EMPTY: break;
+	case INIT_STRING:
+		for (int i = 0; i < init->string.len; i++)
+			buffer[i] = init->string.str[i];
+		break;
 
-		if (offset >= size)
-			ICE("Ran out of buffer.");
+	case INIT_EXPRESSION: {
+		struct constant *c = expression_to_constant(init->expr);
+		if (c) {
+			switch (c->type) {
+			case CONSTANT_TYPE:
+				constant_to_buffer(buffer, *c, bit_offset, bit_size);
+				break;
 
-		switch (pair->type) {
-		case IP_EXPRESSION: {
-			struct expr *expr = pair->u.expr;
-			struct constant *c = expression_to_constant(expr);
-			if (c) {
-				switch (c->type) {
-				case CONSTANT_TYPE:
-					constant_to_buffer(buffer + offset, *c, pair->bit_offset, pair->bit_size);
-					break;
+			case CONSTANT_LABEL_POINTER:
+				is_label[0] = 1;
+				labels[0] = c->label.label;
+				label_offsets[0] = c->label.offset;
+				break;
 
-				case CONSTANT_LABEL_POINTER:
-					is_label[offset] = 1;
-					labels[offset] = c->label.label;
-					label_offsets[offset] = c->label.offset;
-					break;
+			case CONSTANT_LABEL:
+				NOTIMP();
+				break;
 
-				case CONSTANT_LABEL:
-					NOTIMP();
-					break;
-
-				default:
-					NOTIMP();
-				}
-			} else if (expr->type == E_COMPOUND_LITERAL) {
-				codegen_initializer_recursive(expr->compound_literal.init,
-											  buffer + offset,
-											  labels + offset,
-											  label_offsets + offset,
-											  is_label + offset,
-											  size - offset);
-			} else {
-				ICE("Invalid constant expression in static initializer of type %s.",
-					dbg_type(expr->data_type));
+			default:
+				NOTIMP();
 			}
-		} break;
-		case IP_STRING:
-			for (int i = 0; i < pair->u.str.len; i++) 
-				buffer[offset + i] = pair->u.str.str[i];
-			break;
+		} else if (init->expr->type == E_COMPOUND_LITERAL) {
+			codegen_initializer_recursive(&init->expr->compound_literal.init, type,
+										  -1, -1,
+										  buffer, labels, label_offsets,
+										  is_label);
 		}
+	} break;
+	case INIT_BRACE:
+		for (int i = 0; i < init->brace.size; i++) {
+			int coffset, cbit_size, cbit_offset;
+			struct type *child_type = type_select(type, i);
+			type_get_offsets(type, i, &coffset, &cbit_offset, &cbit_size);
+			codegen_initializer_recursive(init->brace.entries + i, child_type,
+										  cbit_size, cbit_offset,
+										  buffer + coffset, labels + coffset,
+										  label_offsets + coffset, is_label + coffset);
+		}
+		break;
 	}
 }
 
@@ -159,18 +157,20 @@ void codegen_initializer(struct type *type, struct initializer *init);
 
 void codegen_compound_literals(struct expr **expr, int lvalue) {
 	switch ((*expr)->type) {
+	case E_DOT_OPERATOR:
+		if (lvalue) {
+			codegen_compound_literals(&(*expr)->member.lhs, 1);
+		} else {
+			NOTIMP();
+		}
+		break;
 	case E_GENERIC_SELECTION:
-	case E_DOT_OPERATOR: NOTIMP();
 	case E_COMPOUND_LITERAL:
 		if (lvalue) {
-			static int counter = 0;
-			char name[256];
-			sprintf(name, ".compundliteral%d", counter++);
-			emit("%s:", name);
+			label_id label = register_label();//register_label_name(sv_from_str(strdup(name)));
+			asm_label(0, label);
 			codegen_initializer((*expr)->compound_literal.type,
-								(*expr)->compound_literal.init);
-
-			label_id label = register_label_name(sv_from_str(strdup(name)));
+								&(*expr)->compound_literal.init);
 
 			*expr = expr_new((struct expr) {
 					.type = E_CONSTANT,
@@ -230,40 +230,50 @@ void codegen_compound_literals(struct expr **expr, int lvalue) {
 
 void codegen_pre_initializer(struct initializer *init) {
 	// Iterate through all child expressions and find uninitialized compound literals.
-	for (int i = 0; i < init->size; i++) {
-		struct init_pair *pair = init->pairs + i;
+	switch (init->type) {
+	case INIT_BRACE:
+		for (int i = 0; i < init->brace.size; i++)
+			codegen_pre_initializer(init->brace.entries + i);
+		break;
 
-		if (pair->type == IP_EXPRESSION)
-			codegen_compound_literals(&pair->u.expr, 0);
+	case INIT_EXPRESSION:
+		codegen_compound_literals(&init->expr, 0);
+		break;
+
+	default: break;
 	}
 }
 
 void codegen_initializer(struct type *type,
 						 struct initializer *init) {
 	// TODO: Make this more portable.
-	size_t size = calculate_size(type);
+	int size = calculate_size(type);
+	if (size == -1) {
+		printf("TYPE FAIL: %s\n", dbg_type(type));
+	}
+	assert(size != -1);
 
 	uint8_t *buffer = malloc(sizeof *buffer * size);
 	label_id *labels = malloc(sizeof *labels * size);
 	int64_t *label_offsets = malloc(sizeof *label_offsets * size);
 	int *is_label = malloc(sizeof *is_label * size);
 
-	for (unsigned i = 0; i < size; i++) {
+	for (int i = 0; i < size; i++) {
 		buffer[i] = 0;
 		is_label[i] = 0;
 		labels[i] = 0;
 		label_offsets[i] = 0;
 	}
 
-	codegen_initializer_recursive(init, buffer, labels, label_offsets, is_label, size);
+	codegen_initializer_recursive(init, type, -1, -1, buffer, labels, label_offsets, is_label);
 
-	for (unsigned i = 0; i < size; i++) {
+	for (int i = 0; i < size; i++) {
 		if (is_label[i]) {
-			if (label_offsets[i] == 0)
-				emit(".quad %s", rodata_get_label_string(labels[i]));
-			else
-				emit(".quad %s+%lld", rodata_get_label_string(labels[i]),
-					label_offsets[i]);
+			if (label_offsets[i] == 0) {
+				asm_quad(IMML_ABS(labels[i], 0));
+			} else {
+				asm_quad(IMML_ABS(labels[i], label_offsets[i]));
+			}
 			i += 7;
 		} else {
 			int how_long = 0;
@@ -272,10 +282,10 @@ void codegen_initializer(struct type *type,
 					break;
 			}
 			if (how_long == 8) {
-				emit(".quad %" PRIu64, *(uint64_t *)(buffer + i));
+				asm_quad(IMM_ABS(*(uint64_t *)(buffer + i)));
 				i += how_long - 1;
 			} else {
-				emit(".byte %d", (int)buffer[i]);
+				asm_byte(IMM_ABS(buffer[i]));
 			}
 		}
 	}
@@ -287,22 +297,22 @@ void codegen_initializer(struct type *type,
 }
 
 void codegen_static_var(struct static_var *static_var) {
-	set_section(".data");
-	if (static_var->global)
-		emit(".global %.*s", static_var->label.len, static_var->label.str);
-	if (static_var->init) {
-		codegen_pre_initializer(static_var->init);
+	(void)static_var;
+	asm_section(".data");
 
-		emit("%.*s:", static_var->label.len, static_var->label.str);
+	if (static_var->init.type == INIT_EMPTY) {
+		asm_label(static_var->global, static_var->label_);
 
-		codegen_initializer(static_var->type,
-							static_var->init);
+		asm_zero(calculate_size(static_var->type));
 	} else {
-		emit("%.*s:", static_var->label.len, static_var->label.str);
+		codegen_pre_initializer(&static_var->init);
 
-		emit(".zero %d", calculate_size(static_var->type));
+		asm_label(static_var->global, static_var->label_);
+
+		codegen_initializer(static_var->type, &static_var->init);
 	}
-	set_section(".text");
+
+	asm_section(".text");
 }
 
 void data_codegen(void) {

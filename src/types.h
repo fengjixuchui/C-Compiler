@@ -138,6 +138,7 @@ struct type *type_deref(struct type *type);
 struct type *type_struct(struct struct_data *struct_data);
 struct type *type_make_const(struct type *type, int is_const);
 struct type *type_adjust_parameter(struct type *type);
+struct type *type_remove_qualifications(struct type *type);
 
 void type_evaluate_vla(struct type *type);
 int type_contains_unevaluated_vla(struct type *type);
@@ -145,8 +146,8 @@ int type_contains_unevaluated_vla(struct type *type);
 int type_search_member(struct type *type, struct string_view name,
 					   int *n, int **indices);
 
-void type_select(struct type *type, int index,
-				 int *field_offset, struct type **field_type);
+struct type *type_select(struct type *type, int index);
+void type_get_offsets(struct type *type, int index, int *offset, int *bit_offset, int *bit_size);
 
 int type_is_real(struct type *type);
 int type_is_arithmetic(struct type *type);

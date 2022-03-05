@@ -40,5 +40,11 @@ int main() {
 	assert(1e-6 > 0.0000009 && 1e-6 < 0.0000011);
 	assert(1e6 > 999999 && 1e6 < 1000001);
 
+	{
+		float f = .1f;
+	}
+
+	float f2 = 3.14;
+
 	return 0;
 }

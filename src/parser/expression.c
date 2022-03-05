@@ -6,6 +6,7 @@
 #include <common.h>
 #include <codegen/rodata.h>
 #include <precedence.h>
+#include <abi/abi.h>
 
 #include <assert.h>
 
@@ -155,12 +156,8 @@ struct type *calculate_type(struct expr *expr) {
 	case E_CAST:
 		return expr->cast.target;
 
-	case E_DOT_OPERATOR: {
-		struct type *type;
-		int offset;
-		type_select(expr->member.lhs->data_type, expr->member.member_idx, &offset, &type);
-		return type;
-	}
+	case E_DOT_OPERATOR:
+		return type_select(expr->member.lhs->data_type, expr->member.member_idx);
 
 	case E_CONDITIONAL:
 		assert(expr->args[1]->data_type == expr->args[2]->data_type);
@@ -236,11 +233,17 @@ void cast_conditional(struct expr *expr) {
 		return;
 
 	if (type_is_pointer(a) && type_is_pointer(b)) {
+		struct type *composite;
 		if (type_deref(a) == type_simple(ST_VOID))
 			expr->args[1] = expression_cast(expr->args[1], b);
 		else if (type_deref(b) == type_simple(ST_VOID))
 			expr->args[2] = expression_cast(expr->args[2], a);
-		else {
+		else if ((composite = type_make_composite(type_remove_qualifications(type_deref(a)),
+												  type_remove_qualifications(type_deref(b))))) {
+			composite = type_pointer(composite);
+			expr->args[2] = expression_cast(expr->args[2], composite);
+			expr->args[1] = expression_cast(expr->args[1], composite);
+		} else {
 			ICE("Invalid combination of data types:\n%s and %s\n",
 				strdup(dbg_type(a)),
 				strdup(dbg_type(b)));
@@ -253,9 +256,9 @@ void cast_conditional(struct expr *expr) {
 			   type_is_arithmetic(b)) {
 		convert_arithmetic(&expr->args[1], &expr->args[2]);
 	} else if (a != b) {
-		ICE("Invalid combination of data types:\n%s and %s\n",
-			strdup(dbg_type(a)),
-			strdup(dbg_type(b)));
+		ERROR(T0->pos, "Invalid combination of data types:\n%s and %s\n",
+			  strdup(dbg_type(a)),
+			  strdup(dbg_type(b)));
 	}
 }
 
@@ -398,13 +401,11 @@ struct expr *expr_new(struct expr expr) {
 		decay_array(&expr.args[i]);
 	}
 
-	if (expr.type == E_BUILTIN_VA_ARG) {
-		decay_array(&expr.va_arg_.v);
-	} else if (expr.type == E_BUILTIN_VA_START) {
-		decay_array(&expr.va_start_.array);
-	} else if (expr.type == E_BUILTIN_VA_COPY) {
+	if (expr.type == E_BUILTIN_VA_COPY) {
 		decay_array(&expr.va_copy_.d);
 		decay_array(&expr.va_copy_.s);
+	} else if (expr.type == E_BUILTIN_VA_ARG) {
+		decay_array(&expr.va_arg_.v);
 	} else if (expr.type == E_CALL) {
 		for (int i = 0; i < expr.call.n_args; i++)
 			decay_array(&expr.call.args[i]);
@@ -453,7 +454,7 @@ struct expr *expr_new(struct expr expr) {
 
 void pointer_increment(var_id result, var_id pointer, struct expr *index, int decrement, struct type *type) {
 	var_id size = expression_to_ir(type_sizeof(type_deref(type)));
-	var_id index_var = expression_to_ir(expression_cast(index, type_simple(ST_ULONG)));
+	var_id index_var = expression_to_ir(expression_cast(index, type_simple(abi_info.pointer_type)));
 	IR_PUSH_BINARY_OPERATOR(IBO_MUL, index_var, size, index_var);
 	IR_PUSH_BINARY_OPERATOR(decrement ? IBO_SUB : IBO_ADD, pointer, index_var, result);
 }
@@ -698,7 +699,7 @@ var_id expression_to_ir_result(struct expr *expr, var_id res) {
 			ICE("Can't call type %s", dbg_type(func_type));
 		}
 
-		IR_PUSH_CALL_VARIABLE(func_var, type_deref(func_type), arg_types, expr->call.n_args, args, res);
+		ir_call(res, func_var, type_deref(func_type), expr->call.n_args, arg_types, args);
 	} break;
 
 	case E_VARIABLE:
@@ -847,32 +848,45 @@ var_id expression_to_ir_result(struct expr *expr, var_id res) {
 	case E_BUILTIN_VA_END:
 		break;
 
-	case E_BUILTIN_VA_START: {
-		var_id ptr = expression_to_ir(expr->va_start_.array);
+	case E_BUILTIN_VA_START:
 		get_current_function()->uses_va = 1;
-		IR_PUSH_VA_START(ptr);
-	} break;
+		IR_PUSH_VA_START(expression_to_address(expr->va_start_.array));
+		break;
 
-	case E_BUILTIN_VA_ARG: {
-		var_id ptr = expression_to_ir(expr->va_arg_.v);
-		IR_PUSH_VA_ARG(ptr, res, expr->va_arg_.t);
-	} break;
+	case E_BUILTIN_VA_ARG:
+		if (abi_info.va_list_is_reference) {
+			IR_PUSH_VA_ARG(expression_to_address(expr->va_arg_.v), res, expr->va_arg_.t);
+		} else {
+			IR_PUSH_VA_ARG(expression_to_ir(expr->va_arg_.v), res, expr->va_arg_.t);
+		}
+		break;
 
 	case E_BUILTIN_VA_COPY: {
-		var_id dest = expression_to_ir(expr->va_copy_.d);
-		var_id source = expression_to_ir(expr->va_copy_.s);
+		if (abi_info.va_list_is_reference) {
+			var_id dest = expression_to_address(expr->va_copy_.d);
+			var_id source = expression_to_ir(expr->va_copy_.s);
 
-		var_id tmp = new_variable(type_deref(expr->va_copy_.d->data_type), 1, 1);
+			var_id address = new_variable_sz(8, 1, 1);
+			var_id tmp = new_variable(expr->va_copy_.d->data_type, 1, 1);
 
-		IR_PUSH_LOAD(tmp, source);
-		IR_PUSH_STORE(tmp, dest);
+			IR_PUSH_ADDRESS_OF(address, source);
+			IR_PUSH_LOAD(tmp, address);
+			IR_PUSH_STORE(tmp, dest);
+		} else {
+			var_id dest = expression_to_ir(expr->va_copy_.d);
+			var_id source = expression_to_ir(expr->va_copy_.s);
+
+			var_id tmp = new_variable(type_deref(expr->va_copy_.d->data_type), 1, 1);
+
+			IR_PUSH_LOAD(tmp, source);
+			IR_PUSH_STORE(tmp, dest);
+		}
 	} break;
 
-	case E_COMPOUND_LITERAL: {
-		struct initializer *init = expr->compound_literal.init;
-		ir_init_var(init, res);
+	case E_COMPOUND_LITERAL:
+		ir_init_var(&expr->compound_literal.init, expr->compound_literal.type, res);
 		variable_set_stack_bucket(res, 0); // compound literals live until end of block.
-	} break;
+		break;
 
 	case E_COMMA:
 		expression_to_ir(expr->args[0]);
@@ -946,7 +960,7 @@ struct expr *parse_prefix() {
 		if (cast_type) {
 			TEXPECT(T_RPAR);
 			if (T0->type == T_LBRACE) {
-				struct initializer *init = parse_initializer(&cast_type);
+				struct initializer init = parse_initializer(&cast_type);
 				return expr_new((struct expr) {
 						.type = E_COMPOUND_LITERAL,
 						.compound_literal = { cast_type, init }
@@ -1055,7 +1069,7 @@ struct expr *parse_prefix() {
 	} else if (T0->type == T_STRING_WCHAR) {
 		struct string_view str = T0->str;
 		TNEXT();
-		return EXPR_STR(str, WCHAR_TYPE);
+		return EXPR_STR(str, abi_info.wchar_type);
 	} else if (T0->type == T_NUM) {
 		struct constant c = constant_from_string(T0->str);
 		TNEXT();
@@ -1076,7 +1090,7 @@ struct expr *parse_prefix() {
 			ERROR(T0->pos, "Expected expression.");
 
 		decay_array(&expr);
-		struct type *match_type = expr->data_type;
+		struct type *match_type = type_make_const(expr->data_type, 0);
 
 		struct expr *res = NULL;
 		int res_is_default = 0;
@@ -1326,17 +1340,39 @@ int evaluate_constant_expression(struct expr *expr,
 		return 0;
 	} break;
 
+	case E_DOT_OPERATOR: {
+		struct constant lhs;
+		if (!evaluate_constant_expression(expr->member.lhs, &lhs))
+			return 0;
+
+		if (lhs.type == CONSTANT_LABEL) {
+			int offset, bit_offset, bit_size;
+			type_get_offsets(lhs.data_type, expr->member.member_idx,
+							 &offset, &bit_offset, &bit_size);
+
+			if (bit_size != -1)
+				return 0;
+
+			struct type *child_type = type_select(lhs.data_type, expr->member.member_idx);
+
+			*constant = lhs;
+			constant->label.offset += offset;
+			constant->data_type = child_type;
+
+			return 1;
+		}
+
+		return 0;
+	} break;
+
 	case E_BINARY_OP: {
 		struct constant lhs, rhs;
 		if (!evaluate_constant_expression(expr->args[0], &lhs))
 			return 0;
 		if (!evaluate_constant_expression(expr->args[1], &rhs))
 			return 0;
-		if (lhs.type != CONSTANT_TYPE ||
-			rhs.type != CONSTANT_TYPE) {
+		if (!operators_constant(expr->binary_op, lhs, rhs, constant))
 			return 0;
-		}
-		*constant = operators_constant(expr->binary_op, lhs, rhs);
 	} break;
 
 	case E_UNARY_OP: {
@@ -1345,7 +1381,8 @@ int evaluate_constant_expression(struct expr *expr,
 			return 0;
 		if (rhs.type == CONSTANT_LABEL)
 			return 0;
-		*constant = operators_constant_unary(expr->unary_op, rhs);
+		if (!operators_constant_unary(expr->unary_op, rhs, constant))
+			return 0;
 	} break;
 
 	case E_ARRAY_PTR_DECAY: {
@@ -1370,16 +1407,10 @@ int evaluate_constant_expression(struct expr *expr,
 		if (!evaluate_constant_expression(expr->args[2], &rhs))
 			return 0;
 
-		if (lhs.type == CONSTANT_LABEL ||
-			mid.type == CONSTANT_LABEL ||
-			rhs.type == CONSTANT_LABEL)
+		if (lhs.type != CONSTANT_TYPE ||
+			mid.type != CONSTANT_TYPE ||
+			rhs.type != CONSTANT_TYPE)
 			return 0;
-
-		assert(lhs.type == CONSTANT_TYPE);
-		assert(mid.type == CONSTANT_TYPE);
-		assert(rhs.type == CONSTANT_TYPE);
-
-		assert(is_scalar(lhs.data_type));
 
 		if (constant_is_zero(&lhs)) {
 			*constant = rhs;
@@ -1456,38 +1487,19 @@ int constant_is_zero(struct constant *c) {
 	if (c->type != CONSTANT_TYPE)
 		return 0;
 
-	if (c->data_type->type == TY_SIMPLE) {
-		switch (c->data_type->simple) {
-		case ST_INT:
-			return c->int_d == 0;
-		case ST_UINT:
-			return c->uint_d == 0;
-		case ST_LONG:
-			return c->long_d == 0;
-		case ST_ULONG:
-			return c->ulong_d == 0;
-		case ST_LLONG:
-			return c->llong_d == 0;
-		case ST_ULLONG:
-			return c->ullong_d == 0;
-		case ST_CHAR:
-			return c->char_d == 0;
-		case ST_UCHAR:
-			return c->uchar_d == 0;
-		case ST_SCHAR:
-			return c->schar_d == 0;
-		case ST_SHORT:
-			return c->short_d == 0;
-		case ST_USHORT:
-			return c->ushort_d == 0;
-		default:
-			return 0;
-		}
+	if (type_is_simple(c->data_type, ST_FLOAT)) {
+		return c->double_d == 0;
+	} else if (type_is_simple(c->data_type, ST_DOUBLE)) {
+		return c->float_d == 0;
+	} else if (type_is_integer(c->data_type) && is_signed(c->data_type->simple)) {
+		return c->int_d == 0;
+	} else if (type_is_integer(c->data_type) && !is_signed(c->data_type->simple)) {
+		return c->uint_d == 0;
 	} else if (c->data_type->type == TY_POINTER) {
-		return c->ulong_d == 0;
-	} else {
-		return 0;
+		return c->uint_d == 0;
 	}
+
+	return 0;
 }
 
 int expression_is_zero(struct expr *expr) {

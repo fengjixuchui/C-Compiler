@@ -1,6 +1,7 @@
 #include "directives.h"
 #include "macro_expander.h"
 #include "tokenizer.h"
+#include "string_concat.h"
 
 #include <common.h>
 #include <precedence.h>
@@ -28,26 +29,23 @@ struct token next() {
 	return t;
 }
 
-#define NEXT() next()
-#define PUSH(T) push(T)
-
 void directiver_define(void) {
-	struct token name = NEXT();
+	struct token name = next();
 
 	struct define def = define_init(name.str);
 
-	struct token t = NEXT();
+	struct token t = next();
 	if(t.type == T_LPAR && !t.whitespace) {
 		int idx = 0;
 		do {
-			t = NEXT();
+			t = next();
 			if(idx == 0 && t.type == T_RPAR) {
 				def.func = 1;
 				break;
 			}
 
 			if (t.type == T_ELLIPSIS) {
-				t = NEXT();
+				t = next();
 				EXPECT(&t, T_RPAR);
 				def.vararg = 1;
 				def.func = 1;
@@ -56,28 +54,28 @@ void directiver_define(void) {
 			EXPECT(&t, T_IDENT);
 			define_add_par(&def, t);
 
-			t = NEXT();
+			t = next();
 			if (t.type != T_RPAR)
 				EXPECT(&t, T_COMMA);
 
 			idx++;
 		} while(t.type == T_COMMA);
 
-		t = NEXT();
+		t = next();
 	}
 
 	while(!t.first_of_line) {
 		define_add_def(&def, t);
-		t = NEXT();
+		t = next();
 	}
 
-	PUSH(t);
+	push(t);
 
 	define_map_add(def);
 }
 
 void directiver_undef(void) {
-	struct token name = NEXT();
+	struct token name = next();
 
 	EXPECT(&name, T_IDENT);
 	define_map_remove(name.str);
@@ -120,29 +118,10 @@ intmax_t evaluate_expression(int prec, int evaluate) {
 			ERROR(t.pos, "Floating point arithmetic in the preprocessor is not allowed.");
 		if (!type_is_integer(c.data_type))
 			ERROR(t.pos, "Preprocessor variables must be of integer type.");
-		switch (c.data_type->simple) {
-		case ST_INT:
-			expr = c.int_d;
-			break;
-		case ST_UINT:
-			expr = c.uint_d;
-			break;
-		case ST_LONG:
-			expr = c.long_d;
-			break;
-		case ST_ULONG:
-			expr = c.ulong_d;
-			break;
-		case ST_LLONG:
-			expr = c.llong_d;
-			break;
-		case ST_ULLONG:
-			expr = c.ullong_d;
-			break;
-		default: NOTIMP();
-		}
+		if (type_is_integer(c.data_type))
+			expr = is_signed(c.data_type->simple) ? (intmax_t)c.int_d : (intmax_t)c.uint_d;
 	} else if (t.type == T_CHARACTER_CONSTANT) {
-		expr = character_constant_to_int(t.str);
+		expr = escaped_character_constant_to_int(t);
 	} else {
 		ERROR(t.pos, "Invalid token in preprocessor expression. %s", dbg_token(&t));
 	}
@@ -213,31 +192,31 @@ intmax_t evaluate_expression(int prec, int evaluate) {
 
 intmax_t evaluate_until_newline() {
 	buffer.size = 0;
-	struct token t = NEXT();
+	struct token t = next();
 	while (!t.first_of_line) {
 		if (sv_string_cmp(t.str, "defined")) {
-			t = NEXT();
+			t = next();
 			int has_lpar = t.type == T_LPAR;
 			if (has_lpar)
-				t = NEXT();
+				t = next();
 
 			int is_defined = define_map_get(t.str) != NULL;
 			token_list_add(&buffer, (struct token) {.type = T_NUM, .str = is_defined ? sv_from_str("1") :
 					sv_from_str("0")});
 
-			t = NEXT();
+			t = next();
 
 			if (has_lpar) {
 				EXPECT(&t, T_RPAR);
-				t = NEXT();
+				t = next();
 			}
 		} else {
 			token_list_add(&buffer, t);
 
-			t = NEXT();
+			t = next();
 		}
 	}
-	PUSH(t);
+	push(t);
 
 	expand_token_list(&buffer);
 	token_list_add(&buffer, (struct token) { .type = T_EOI });
@@ -250,164 +229,159 @@ intmax_t evaluate_until_newline() {
 
 int directiver_evaluate_conditional(struct token dir) {
 	if (sv_string_cmp(dir.str, "ifdef")) {
-		return (define_map_get(NEXT().str) != NULL);
+		return (define_map_get(next().str) != NULL);
 	} else if (sv_string_cmp(dir.str, "ifndef")) {
-		return !(define_map_get(NEXT().str) != NULL);
+		return !(define_map_get(next().str) != NULL);
 	} else if (sv_string_cmp(dir.str, "if") ||
 			   sv_string_cmp(dir.str, "elif")) {
 		return evaluate_until_newline();
+	} else if (sv_string_cmp(dir.str, "else")) {
+		return 1;
 	}
 
 	ERROR(dir.pos, "Invalid conditional directive");
 }
 
-static int else_stack_n = 0, else_stack_cap = 0;
-static int *else_stack = NULL;
-
-void directiver_flush_if(void) {
-	int nest_level = 1;
-	while (nest_level > 0) {
-		struct token t;
-		do {
-			t = NEXT();
-			if (t.type == T_EOI)
-				ERROR(t.pos, "Reading past end of file");
-		} while (t.type != PP_DIRECTIVE);
-
-		struct token dir = NEXT();
-		struct string_view name = dir.str;
-		if (sv_string_cmp(name, "if") ||
-			sv_string_cmp(name, "ifdef") ||
-			sv_string_cmp(name, "ifndef")) {
-			nest_level++;
-		} else if (sv_string_cmp(name, "elif")) {
-			if (nest_level == 1) {
-				PUSH(dir);
-				PUSH(t);
-				return;
-			}
-		} else if (sv_string_cmp(name, "else")) {
-			if (nest_level == 1 && !else_stack[else_stack_n - 1])
-				return;
-		} else if (sv_string_cmp(name, "endif")) {
-			nest_level--;
-		}
-	}
-	else_stack_n--;
-}
-
 void directiver_handle_pragma(void) {
-	struct token command = NEXT();
+	struct token command = next();
 
 	if (sv_string_cmp(command.str, "once")) {
 		tokenizer_disable_current_path();
 	} else {
-		ERROR(command.pos, "\"#pragma %s\" not supported", dbg_token(&command));
+		WARNING(command.pos, "\"#pragma %s\" not supported", dbg_token(&command));
+		struct token t = next();
+		while (!t.first_of_line)
+			t = next();
+		push(t);
 	}
 }
 
 struct token directiver_next(void) {
-	struct token t = NEXT();
-	while (t.type == PP_DIRECTIVE) {
-		struct token directive = NEXT();
+	static int cond_stack_n = 0, cond_stack_cap = 0;
+	static int *cond_stack = NULL;
+
+	if (cond_stack_n == 0)
+		ADD_ELEMENT(cond_stack_n, cond_stack_cap, cond_stack) = 1;
+
+	struct token t = next();
+	while (t.type == PP_DIRECTIVE || cond_stack[cond_stack_n - 1] != 1) {
+		if (t.type != PP_DIRECTIVE) {
+			t = next();
+			continue;
+		}
+		struct token directive = next();
 
 		if (directive.first_of_line) {
 			t = directive;
 			continue;
 		}
 
-		struct string_view name = directive.str;
-		assert(directive.type == T_IDENT);
-
-		int is_if = 0;
-		if (sv_string_cmp(name, "define")) {
-			directiver_define();
-		} else if (sv_string_cmp(name, "undef")) {
-			define_map_remove(NEXT().str);
-		} else if (sv_string_cmp(name, "error")) {
-			ERROR(directive.pos, "#error directive was invoked.");
-		} else if (sv_string_cmp(name, "include")) {
-			// There is an issue with just resetting after include. But
-			// I'm interpreting the standard liberally to allow for this.
-			new_filename = NULL;
-			line_diff = 0;
-			struct token path_tok = NEXT();
-			int system = path_tok.type == PP_HEADER_NAME_H;
-			struct string_view path = path_tok.str;
-			path.str++;
-			path.len -= 2;
-			tokenizer_push_input(sv_to_str(path), system);
-		} else if ((is_if = sv_string_cmp(name, "ifndef")) ||
-				   (is_if = sv_string_cmp(name, "ifdef")) ||
-				   (is_if = sv_string_cmp(name, "if")) ||
-				   sv_string_cmp(name, "elif")) {
-			if (is_if)
-				ADD_ELEMENT(else_stack_n, else_stack_cap, else_stack) = 0;
-			int result = directiver_evaluate_conditional(directive);
-			if (result)
-				else_stack[else_stack_n - 1] = 1;
-			if (!result)
-				directiver_flush_if();
-		} else if (sv_string_cmp(name, "else")) {
-			directiver_flush_if();
-		} else if (sv_string_cmp(name, "endif")) {
-			// Do nothing.
-		} else if (sv_string_cmp(name, "pragma")) {
-			directiver_handle_pragma();
-		} else if (sv_string_cmp(name, "line")) {
-			// 6.10.4
-			struct token digit_seq = NEXT(), s_char_seq;
-
-			if (digit_seq.first_of_line)
-				ERROR(digit_seq.pos, "Expected digit sequence after #line");
-
-			int has_s_char_seq = 0;
-			if (digit_seq.type != T_NUM) {
-				buffer.size = 0;
-				struct token t = digit_seq;
-				while (!t.first_of_line) {
-					token_list_add(&buffer, t);
-					t = NEXT();
-				}
-
-				PUSH(t);
-
-				expand_token_list(&buffer);
-
-				if (buffer.size == 0) {
-					ERROR(digit_seq.pos, "Invalid #line macro expansion");
-				} else if (buffer.size >= 1) {
-					digit_seq = buffer.list[0];
-				} else if (buffer.size >= 2) {
-					s_char_seq = buffer.list[1];
-					has_s_char_seq = 1;
-				}
-			} else {
-				s_char_seq = NEXT();
-				if (s_char_seq.first_of_line) {
-					PUSH(s_char_seq);
-				} else {
-					has_s_char_seq = 1;
-				}
-			}
-
-			if (digit_seq.first_of_line || digit_seq.type != T_NUM)
-				ERROR(digit_seq.pos, "Expected digit sequence after #line");
-
-			line_diff += atoi(sv_to_str(digit_seq.str)) - directive.pos.line - 1;
-
-			if (has_s_char_seq) {
-				if (s_char_seq.type != T_STRING)
-					ERROR(s_char_seq.pos, "Expected s char sequence as second argument to #line");
-				s_char_seq.str.len -= 2;
-				s_char_seq.str.str++;
-				new_filename = sv_to_str(s_char_seq.str);
-			}
-		} else {
-			ERROR(directive.pos, "#%s not implemented", dbg_token(&directive));
+		if (directive.type != T_IDENT &&
+			cond_stack[cond_stack_n - 1] != 1) {
+			t = directive;
+			continue;
 		}
 
-		t = NEXT();
+		struct string_view name = directive.str;
+
+		assert(directive.type == T_IDENT);
+
+		if (sv_string_cmp(name, "ifndef") ||
+			sv_string_cmp(name, "ifdef") ||
+			sv_string_cmp(name, "if")) {
+			if (cond_stack[cond_stack_n - 1] == 1) {
+				int result = directiver_evaluate_conditional(directive);
+				ADD_ELEMENT(cond_stack_n, cond_stack_cap, cond_stack) = result ? 1 : 0;
+			} else {
+				ADD_ELEMENT(cond_stack_n, cond_stack_cap, cond_stack) = -1;
+			}
+		} else if (sv_string_cmp(name, "elif") ||
+				   sv_string_cmp(name, "else")) {
+			if (cond_stack[cond_stack_n - 1] == 0) {
+				int result = directiver_evaluate_conditional(directive);
+				cond_stack[cond_stack_n - 1] = result;
+			} else {
+				cond_stack[cond_stack_n - 1] = -1;
+			}
+		} else if (sv_string_cmp(name, "endif")) {
+			cond_stack_n--;
+		} else if (cond_stack[cond_stack_n - 1] == 1) {
+			if (sv_string_cmp(name, "define")) {
+				directiver_define();
+			} else if (sv_string_cmp(name, "undef")) {
+				define_map_remove(next().str);
+			} else if (sv_string_cmp(name, "error")) {
+				ERROR(directive.pos, "#error directive was invoked.");
+			} else if (sv_string_cmp(name, "include")) {
+				// There is an issue with just resetting after include. But
+				// I'm interpreting the standard liberally to allow for this.
+				new_filename = NULL;
+				line_diff = 0;
+				struct token path_tok = next();
+				int system = path_tok.type == PP_HEADER_NAME_H;
+				struct string_view path = path_tok.str;
+				path.str++;
+				path.len -= 2;
+				tokenizer_push_input(sv_to_str(path), system);
+			} else if (sv_string_cmp(name, "endif")) {
+				// Do nothing.
+			} else if (sv_string_cmp(name, "pragma")) {
+				directiver_handle_pragma();
+			} else if (sv_string_cmp(name, "line")) {
+				// 6.10.4
+				struct token digit_seq = next(), s_char_seq;
+
+				if (digit_seq.first_of_line)
+					ERROR(digit_seq.pos, "Expected digit sequence after #line");
+
+				int has_s_char_seq = 0;
+				if (digit_seq.type != T_NUM) {
+					buffer.size = 0;
+					struct token t = digit_seq;
+					while (!t.first_of_line) {
+						token_list_add(&buffer, t);
+						t = next();
+					}
+
+					push(t);
+
+					expand_token_list(&buffer);
+
+					if (buffer.size == 0) {
+						ERROR(digit_seq.pos, "Invalid #line macro expansion");
+					} else if (buffer.size >= 1) {
+						digit_seq = buffer.list[0];
+					} else if (buffer.size >= 2) {
+						s_char_seq = buffer.list[1];
+						has_s_char_seq = 1;
+					}
+				} else {
+					s_char_seq = next();
+					if (s_char_seq.first_of_line) {
+						push(s_char_seq);
+					} else {
+						has_s_char_seq = 1;
+					}
+				}
+
+				if (digit_seq.first_of_line || digit_seq.type != T_NUM)
+					ERROR(digit_seq.pos, "Expected digit sequence after #line");
+
+				line_diff += atoi(sv_to_str(digit_seq.str)) - directive.pos.line - 1;
+
+				if (has_s_char_seq) {
+					if (s_char_seq.type != T_STRING)
+						ERROR(s_char_seq.pos, "Expected s char sequence as second argument to #line");
+					s_char_seq.str.len -= 2;
+					s_char_seq.str.str++;
+					new_filename = sv_to_str(s_char_seq.str);
+				}
+			} else {
+				ERROR(directive.pos, "#%s not implemented", dbg_token(&directive));
+			}
+		}
+
+		t = next();
 	}
 
 	return t;

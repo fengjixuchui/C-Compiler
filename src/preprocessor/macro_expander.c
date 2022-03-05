@@ -149,6 +149,7 @@ struct token glue(struct token a, struct token b) {
 
 	ret.str = sv_from_str(allocate_printf("%s%s", sv_to_str(b.str), sv_to_str(a.str))); // TODO: This can be done better.
 	ret.hs = string_set_intersection(a.hs, b.hs);
+	ret.pos = a.pos;
 
 	return ret;
 }
@@ -211,7 +212,9 @@ static struct {
 } output_buffer;
 
 void input_buffer_push(struct token *t) {
-	ADD_ELEMENT(input_buffer.size, input_buffer.cap, input_buffer.tokens) = *t;
+	struct token n_token = *t;
+	n_token.hs = string_set_dup(n_token.hs);
+	ADD_ELEMENT(input_buffer.size, input_buffer.cap, input_buffer.tokens) = n_token;
 }
 
 struct token input_buffer_take(int input) {
@@ -300,9 +303,8 @@ void expand_argument(struct token_list tl, int *concat_with_prev, int concat, in
 
 void subs_buffer(struct define *def, struct string_set *hs, struct position new_pos, int input) {
 	int n_args = def->par.size;
-	if (n_args > 16)
-		ICE("Unsupported number of elements");
-	struct token_list arguments[16] = {0};
+	struct token_list *arguments = malloc(sizeof *arguments * n_args);
+
 	struct token_list vararg = {0};
 	int vararg_included = 0;
 	if(def->func) {
@@ -332,7 +334,6 @@ void subs_buffer(struct define *def, struct string_set *hs, struct position new_
 
 		*hs = string_set_intersection(*hs, rpar.hs);
 	}
-	(void)vararg_included;
 
 	string_set_insert(hs, sv_to_str(def->name));
 
@@ -366,9 +367,6 @@ void subs_buffer(struct define *def, struct string_set *hs, struct position new_
 				i--; // There is an additional i-- at the end of the loop.
 			} else if (vararg_included) {
 				expand_argument(vararg, &concat_with_prev, concat, stringify, input);
-			} else {
-				ERROR(t.pos, "Not implemented, %.*s (%d)", def->name.len, def->name.str, def->func);
-				NOTIMP();
 			}
 		} else if (idx >= 0 && stringify) {
 			struct token_list tl = arguments[idx];
@@ -398,10 +396,10 @@ void subs_buffer(struct define *def, struct string_set *hs, struct position new_
 			} else {
 				t.pos = new_pos;
 				input_buffer_push(&t);
-
-				if (concat)
-					concat_with_prev = 1;
 			}
+
+			if (concat)
+				concat_with_prev = 1;
 		}
 
 		if (concat || stringify)
@@ -416,6 +414,8 @@ void subs_buffer(struct define *def, struct string_set *hs, struct position new_
 		struct token *tok = input_buffer.tokens + i;
 		tok->hs = string_set_union(*hs, tok->hs);
 	}
+
+	free(arguments);
 }
 
 // Expands until empty token.
